@@ -118,27 +118,29 @@ static void print_snapshot(void){
 // ------------------ Children ------------------
 
 static void run_app(int id){
-    // Ignore Ctrl-C so kernel can snapshot without killing apps in same tty
     signal(SIGINT, SIG_IGN);
-
-    raise(SIGSTOP); // wait to be scheduled
+    raise(SIGSTOP);
     srand((unsigned)(time(NULL) ^ getpid()));
     int pc = 0, MAX_PC = 20;
 
     while (pc < MAX_PC){
         sleep(1);
         pc++;
-    
-        // TICK (report PC)
+
+        // TICK
         char tick[64]; int tn = snprintf(tick,sizeof(tick),"TICK A%d %d %d\n", id, getpid(), pc);
-        write(STDOUT_FILENO, tick, tn); 
+        write(STDOUT_FILENO, tick, tn);
         kill(getppid(), SIGUSR2);
 
+        // ~10% chance of syscall; op ∈ {R,W,X}
         if (rand()%10 == 0){
-            int dev = (rand()%2) + 1; 
-            char op = (rand()%2==0) ? 'R':'W';
-            char msg[96]; int n = snprintf(msg,sizeof(msg),"SYSCALL A%d %d D%d %c\n", id, getpid(), dev, op);
-            write(STDOUT_FILENO, msg, n); kill(getppid(), SIGUSR2);
+            int dev = (rand()%2) + 1;
+            char ops[3] = {'R','W','X'};
+            char op = ops[rand()%3];
+            char msg[96];
+            int n = snprintf(msg,sizeof(msg),"SYSCALL A%d %d D%d %c\n", id, getpid(), dev, op);
+            write(STDOUT_FILENO, msg, n);
+            kill(getppid(), SIGUSR2);
             raise(SIGSTOP);
         }
     }
