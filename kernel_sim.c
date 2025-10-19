@@ -102,24 +102,32 @@ static int rq_pop_head(void){
 
 // Central scheduler: pick next from READY queue (if any), else idle
 static void schedule_next(void){
-    int next = rq_pop_head();
-    if (next >= 0){
-        if (running_idx >= 0 && pcbs[running_idx].state==RUNNING){
-            kill(pcbs[running_idx].pid, SIGSTOP);
-            pcbs[running_idx].state = READY;
+    // NEW: pop until we find a truly READY task; drop stale BLOCKED/TERMINATED entries.
+    int tries = rq_sz;           // upper bound: at most current size pops
+    while (tries-- > 0){
+        int next = rq_pop_head();
+        if (next < 0) break;
+        if (pcbs[next].state == READY){
+            if (running_idx >= 0 && pcbs[running_idx].state==RUNNING){
+                kill(pcbs[running_idx].pid, SIGSTOP);
+                pcbs[running_idx].state = READY;
+            }
+            kill(pcbs[next].pid, SIGCONT);
+            pcbs[next].state = RUNNING;
+            running_idx = next;
+            fprintf(stderr,"[Kernel] Now running A%d (PID %d)\n", next+1, pcbs[next].pid);
+            return;
         }
-        kill(pcbs[next].pid, SIGCONT);
-        pcbs[next].state = RUNNING;
-        running_idx = next;
-        fprintf(stderr,"[Kernel] Now running A%d (PID %d)\n", next+1, pcbs[next].pid);
-    } else {
-        if (running_idx >= 0 && pcbs[running_idx].state==RUNNING){
-            kill(pcbs[running_idx].pid, SIGSTOP);
-            pcbs[running_idx].state = READY;
-        }
-        running_idx = -1;
-        fprintf(stderr,"[Kernel] IDLE (no READY)\n");
+        // else: stale entry (BLOCKED/TERMINATED) — skip it and continue
     }
+
+    // none READY → idle
+    if (running_idx >= 0 && pcbs[running_idx].state==RUNNING){
+        kill(pcbs[running_idx].pid, SIGSTOP);
+        pcbs[running_idx].state = READY;
+    }
+    running_idx = -1;
+    fprintf(stderr,"[Kernel] IDLE (no READY)\n");
 }
 
 // ----- kernel signal handlers -----
@@ -229,10 +237,17 @@ static void drain_inter(void){
             }
             int next = rq_pop_head();
             if (next >= 0){
-                kill(pcbs[next].pid, SIGCONT);
-                pcbs[next].state = RUNNING;
-                running_idx = next;
-                fprintf(stderr,"[Kernel] IRQ0 -> Now running A%d (PID %d)\n", next+1, pcbs[next].pid);
+                // guard: only dispatch if truly READY; else keep popping
+                if (pcbs[next].state == READY){
+                    kill(pcbs[next].pid, SIGCONT);
+                    pcbs[next].state = RUNNING;
+                    running_idx = next;
+                    fprintf(stderr,"[Kernel] IRQ0 -> Now running A%d (PID %d)\n", next+1, pcbs[next].pid);
+                } else {
+                    // stale; rely on schedule_next to complete selection
+                    rq_push_tail(next); // optional: drop instead; here we requeue then call scheduler
+                    schedule_next();
+                }
             } else {
                 fprintf(stderr,"[Kernel] IRQ0 -> IDLE (no READY)\n");
             }
@@ -243,12 +258,10 @@ static void drain_inter(void){
                 if (idx>=0 && pcbs[idx].state!=TERMINATED){
                     pcbs[idx].state = READY;
                     rq_push_tail(idx);
-                    // Always show the IRQ1 message (even if CPU was idle)
                     fprintf(stderr,"[Kernel] IRQ1 -> unblocked A%d (PID %d) enqueued\n", idx+1, pid);
                     if (running_idx == -1) schedule_next(); // will print "Now running ..."
                 }
             }
-            // If no waiter, remain silent per your preference
         } else if (strcmp(line,"IRQ2")==0){
             if (hd2 < td2){
                 pid_t pid = qd2[hd2++]; int idx = pid_to_index(pid);
@@ -256,12 +269,10 @@ static void drain_inter(void){
                 if (idx>=0 && pcbs[idx].state!=TERMINATED){
                     pcbs[idx].state = READY;
                     rq_push_tail(idx);
-                    // Always show the IRQ2 message (even if CPU was idle)
                     fprintf(stderr,"[Kernel] IRQ2 -> unblocked A%d (PID %d) enqueued\n", idx+1, pid);
                     if (running_idx == -1) schedule_next(); // will print "Now running ..."
                 }
             }
-            // If no waiter, remain silent per your preference
         } else {
             fprintf(stderr,"[Kernel] Unknown IRQ: '%s'\n", line);
         }
