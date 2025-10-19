@@ -138,7 +138,7 @@ static void h_cont(int s){ (void)s; want_resume   = 1; } // SIGCONT
 
 // ----- snapshot -----
 static void print_snapshot(void){
-    fprintf(stderr, "================ SNAPSHOT (paused) ================\n");
+    fprintf(stderr, "================ SNAPSHOT (paused) PID = %d ================\n", getpid());
     for (int i=0;i<N_APPS;i++){
         struct PCB *p = &pcbs[i];
         fprintf(stderr, "A%d (PID %d): PC=%d, state=%s", p->id, (int)p->pid, p->pc, st_str(p->state));
