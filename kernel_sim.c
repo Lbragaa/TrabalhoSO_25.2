@@ -25,7 +25,7 @@ struct PCB {
     int   state;        // enum ProcState
     int   pc;           // last known PC
     int   last_dev;     // 0/1/2
-    char  last_op;      // 'R'/'W' or '\0'
+    char  last_op;      // 'R'/'W'/'X' or '\0'
     int   cnt_d1;
     int   cnt_d2;
 };
@@ -187,6 +187,8 @@ static void drain_inter(void){
         } else if (strcmp(line,"IRQ1")==0){
             if (hd1 < td1){
                 pid_t pid = qd1[hd1++]; int idx = pid_to_index(pid);
+                // NEW: reset when queue becomes empty
+                if (hd1 == td1) { hd1 = td1 = 0; }
                 if (idx>=0 && pcbs[idx].state!=TERMINATED){
                     pcbs[idx].state = READY;
                     if (running_idx == -1){ switch_running(idx); fprintf(stderr,"[Kernel] IRQ1 → unblocked & running A%d (PID %d)\n", idx+1, pid); }
@@ -196,6 +198,8 @@ static void drain_inter(void){
         } else if (strcmp(line,"IRQ2")==0){
             if (hd2 < td2){
                 pid_t pid = qd2[hd2++]; int idx = pid_to_index(pid);
+                // NEW: reset when queue becomes empty
+                if (hd2 == td2) { hd2 = td2 = 0; }
                 if (idx>=0 && pcbs[idx].state!=TERMINATED){
                     pcbs[idx].state = READY;
                     if (running_idx == -1){ switch_running(idx); fprintf(stderr,"[Kernel] IRQ2 → unblocked & running A%d (PID %d)\n", idx+1, pid); }
