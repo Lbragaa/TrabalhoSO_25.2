@@ -1,4 +1,4 @@
-// kernel_sim.c — signals=wake-ups, pipes=data; no mem*; one read per wake; TICK+snapshot.
+// kernel_sim.c — signals = wake-ups, pipes = data; no mem*; one read per wake; TICK + snapshot.
 // RR with explicit ready FIFO:
 // - IRQ0: running -> tail, head -> running (single-line log)
 // - IRQ1/2: unblock -> tail (always log unblocked/enqueued; if IDLE, dispatch next)
@@ -19,20 +19,20 @@
 #include <sys/wait.h>
 #include <errno.h>
 
-#define N_APPS 5
-#define MAX_BLOCKED N_APPS
-#define MAX_READY   N_APPS
-#define QUANTUM_US  500000   // 0.5s
+#define N_APPS       5
+#define MAX_BLOCKED  N_APPS
+#define MAX_READY    N_APPS
+#define QUANTUM_US   500000   // 0.5s
 
-enum ProcState { READY=0, RUNNING=1, BLOCKED=2, TERMINATED=3 };
+enum ProcState { READY = 0, RUNNING = 1, BLOCKED = 2, TERMINATED = 3 };
 
 struct PCB {
     pid_t pid;
-    int   id;           // 1..N_APPS
-    int   state;        // enum ProcState
-    int   pc;           // last known PC
-    int   last_dev;     // 0/1/2
-    char  last_op;      // 'R'/'W'/'X' or '\0'
+    int   id;          // 1..N_APPS
+    int   state;       // enum ProcState
+    int   pc;          // last known PC
+    int   last_dev;    // 0/1/2
+    char  last_op;     // 'R'/'W'/'X' or '\0'
     int   cnt_d1;
     int   cnt_d2;
 };
@@ -42,60 +42,118 @@ static int running_idx = -1;
 
 // ---- device wait queues (per device) ----
 static pid_t qd1[MAX_BLOCKED], qd2[MAX_BLOCKED];
-static int hd1=0, td1=0, hd2=0, td2=0;
+static int hd1 = 0, td1 = 0;
+static int hd2 = 0, td2 = 0;
 
 // ---- READY queue (global RR FIFO) ----
 static int rq[MAX_READY];
-static int rq_h=0, rq_t=0, rq_sz=0;
+static int rq_h = 0, rq_t = 0, rq_sz = 0;
 
 static int inter_r = -1, app_r = -1;
 static pid_t inter_pid = -1;
 
-// wake flags
+// ---- wake flags ----
 static volatile sig_atomic_t inter_pending = 0;
 static volatile sig_atomic_t app_pending   = 0;
-// pause/resume control (kernel)
+
+// ---- pause/resume control (kernel) ----
 static volatile sig_atomic_t want_snapshot = 0;
 static volatile sig_atomic_t want_resume   = 0;
 static int paused = 0;
 
-// --- InterController local pause flag + handlers at file scope
+// ---- InterController local pause flag + handlers ----
 static volatile sig_atomic_t ic_paused = 0;
-static void ic_h_int (int s){ (void)s; ic_paused = 1; }
-static void ic_h_cont(int s){ (void)s; ic_paused = 0; }
+
+static void ic_h_int(int s)  { (void)s; ic_paused = 1; }
+static void ic_h_cont(int s) { (void)s; ic_paused = 0; }
 
 // ----- small helpers (no mem*) -----
-static int acc_append(char acc[], int acc_cap, int *acc_len, const char src[], int n){
+static int acc_append(char acc[], int acc_cap, int *acc_len,
+                      const char src[], int n)
+{
     int copied = 0;
-    while (copied < n && *acc_len < acc_cap){ acc[*acc_len] = src[copied]; (*acc_len)++; copied++; }
+    while (copied < n && *acc_len < acc_cap) {
+        acc[*acc_len] = src[copied];
+        (*acc_len)++;
+        copied++;
+    }
     return copied;
 }
-static int acc_find_nl(const char acc[], int len){ for (int i=0;i<len;i++) if (acc[i]=='\n') return i; return -1; }
-static void acc_copy_line(const char acc[], int linelen, char dest[], int dest_cap){
-    int k = linelen; if (k >= dest_cap) k = dest_cap-1; for (int i=0;i<k;i++) dest[i]=acc[i]; dest[k]='\0';
+
+static int acc_find_nl(const char acc[], int len)
+{
+    for (int i = 0; i < len; i++)
+        if (acc[i] == '\n')
+            return i;
+    return -1;
 }
-static void acc_consume_line(char acc[], int *acc_len, int linelen){
-    int new_len = *acc_len - (linelen+1); if (new_len < 0) new_len = 0;
-    for (int i=0;i<new_len;i++) acc[i] = acc[linelen+1+i]; *acc_len = new_len;
+
+static void acc_copy_line(const char acc[], int linelen,
+                          char dest[], int dest_cap)
+{
+    int k = linelen;
+    if (k >= dest_cap)
+        k = dest_cap - 1;
+    for (int i = 0; i < k; i++)
+        dest[i] = acc[i];
+    dest[k] = '\0';
+}
+
+static void acc_consume_line(char acc[], int *acc_len, int linelen)
+{
+    int new_len = *acc_len - (linelen + 1);
+    if (new_len < 0)
+        new_len = 0;
+
+    for (int i = 0; i < new_len; i++)
+        acc[i] = acc[linelen + 1 + i];
+
+    *acc_len = new_len;
 }
 
 // ----- misc -----
-static void die(const char *m){ perror(m); exit(1); }
-static ssize_t writeln(int fd, const char *s){ return write(fd, s, strlen(s)); }
-static const char* st_str(int s){ return s==READY?"READY":s==RUNNING?"RUNNING":s==BLOCKED?"BLOCKED":s==TERMINATED?"TERMINATED":"?"; }
-static int pid_to_index(pid_t pid){ for (int i=0;i<N_APPS;i++) if (pcbs[i].pid==pid) return i; return -1; }
+static void die(const char *m) { perror(m); exit(1); }
+
+static ssize_t writeln(int fd, const char *s)
+{
+    return write(fd, s, strlen(s));
+}
+
+static const char* st_str(int s)
+{
+    return s == READY      ? "READY"
+         : s == RUNNING    ? "RUNNING"
+         : s == BLOCKED    ? "BLOCKED"
+         : s == TERMINATED ? "TERMINATED"
+                           : "?";
+}
+
+static int pid_to_index(pid_t pid)
+{
+    for (int i = 0; i < N_APPS; i++)
+        if (pcbs[i].pid == pid)
+            return i;
+    return -1;
+}
 
 // ----- READY queue ops -----
-static void rq_push_tail(int idx){
-    if (rq_sz >= MAX_READY) return; // shouldn't happen with N_APPS cap
+static void rq_push_tail(int idx)
+{
+    if (rq_sz >= MAX_READY)
+        return;  // shouldn't happen with N_APPS cap
+
     rq[rq_t] = idx;
-    rq_t = (rq_t+1) % MAX_READY;
+    rq_t = (rq_t + 1) % MAX_READY;
     rq_sz++;
 }
-static int rq_pop_head(void){
-    if (rq_sz==0) return -1;
+
+static int rq_pop_head(void)
+{
+    if (rq_sz == 0)
+        return -1;
+
     int idx = rq[rq_h];
-    rq_h = (rq_h+1) % MAX_READY;
+    rq_h = (rq_h + 1) % MAX_READY;
     rq_sz--;
     return idx;
 }
@@ -190,7 +248,8 @@ static void run_app(int id){
             int n = snprintf(msg,sizeof(msg),"SYSCALL A%d %d D%d %c\n", id, getpid(), dev, op);
             write(STDOUT_FILENO, msg, n);
             kill(getppid(), SIGUSR2);
-            raise(SIGSTOP);
+
+            raise(SIGSTOP); // The process abides here until unblocked by kernel
         }
     }
     char done[64]; int dn = snprintf(done,sizeof(done),"DONE A%d %d %d\n", id, getpid(), pc);
