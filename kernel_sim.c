@@ -13,8 +13,8 @@
 #define QUANTUM_US   500000   // 0.5s de quantum
 #define MAX_PC       5
 #define SYSCALL_PROB 10       // 10% de chance de syscall a cada tick
-#define IRQ1_PROB          10   // 1 in 10 chance
-#define IRQ2_PROB          20   // 1 in 20 chance
+#define IRQ1_PROB          5   // 1 in 5 chance
+#define IRQ2_PROB          100   // 1 in 100 chance. Ta 20x maior.
 
 // Estados possíveis de um processo
 enum ProcState { READY = 0, RUNNING = 1, BLOCKED = 2, TERMINATED = 3 };
@@ -226,7 +226,8 @@ static void run_app(int id){
     int pc = 0;
 
     while (pc < MAX_PC){
-        sleep(1);
+
+        usleep(QUANTUM_US);
         pc++;
 
         // Envia mensagem TICK ao kernel
@@ -246,6 +247,7 @@ static void run_app(int id){
             kill(getppid(), SIGUSR2);
             raise(SIGSTOP); // pausa até ser desbloqueado
         }
+        usleep(QUANTUM_US);
     }
     // Fim da execução
     char done[64];
