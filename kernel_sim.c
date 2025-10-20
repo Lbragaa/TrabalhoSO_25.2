@@ -14,7 +14,7 @@
 #define MAX_PC       20       // Colocamos 20 instruções por app
 #define SYSCALL_PROB 10       // 10% de chance de syscall a cada tick
 #define IRQ1_PROB     5   // 1 in 5 chance
-#define IRQ2_PROB     100 // 1 in 100 chance. Chance 20x menor que a do IRQ1.
+#define IRQ2_PROB     10 // 1 in 100 chance. Chance 20x menor que a do IRQ1.
 
 // Estados possíveis de um processo
 enum ProcState { READY = 0, RUNNING = 1, BLOCKED = 2, TERMINATED = 3 };
@@ -245,6 +245,7 @@ static void run_app(int id){
             int n = snprintf(msg,sizeof(msg),"SYSCALL A%d %d D%d %c\n", id, getpid(), dev, op);
             write(STDOUT_FILENO, msg, n);
             kill(getppid(), SIGUSR2);
+            raise(SIGSTOP);
         }
         usleep(QUANTUM_US);
     }
@@ -357,36 +358,31 @@ static void drain_apps(void){
                 if (idx>=0 && pcbs[idx].state != TERMINATED)
                     pcbs[idx].pc = pc;
             }
-        } else if (strncmp(line,"SYSCALL",7)==0){
-            // Processo fez syscall → bloqueia
-            int aid, pid, dev; char op;
-            if (sscanf(line,"SYSCALL A%d %d D%d %c",&aid,&pid,&dev,&op)==4){
-                int idx = pid_to_index((pid_t)pid);
-                if (idx>=0 && pcbs[idx].state!=TERMINATED){
-                    pcbs[idx].state = BLOCKED; pcbs[idx].last_dev = dev; pcbs[idx].last_op = op;
-                    if (dev==1){ pcbs[idx].cnt_d1++; if (td1<MAX_BLOCKED) qd1[td1++] = (pid_t)pid; }
-                    else if (dev==2){ pcbs[idx].cnt_d2++; if (td2<MAX_BLOCKED) qd2[td2++] = (pid_t)pid; }
+        } else if (strncmp(line, "SYSCALL", 7) == 0) {
+        int aid, pid, dev; char op;
+        if (sscanf(line, "SYSCALL A%d %d D%d %c", &aid, &pid, &dev, &op) == 4) {
+            int idx = pid_to_index((pid_t)pid);
+            if (idx >= 0 && pcbs[idx].state != TERMINATED) {
+                // 1) State + device queues
+                pcbs[idx].state   = BLOCKED;
+                pcbs[idx].last_dev = dev;
+                pcbs[idx].last_op  = op;
+                if (dev == 1) { pcbs[idx].cnt_d1++; if (td1 < MAX_BLOCKED) qd1[td1++] = (pid_t)pid; }
+                else if (dev == 2){ pcbs[idx].cnt_d2++; if (td2 < MAX_BLOCKED) qd2[td2++] = (pid_t)pid; }
 
-                    if (idx == running_idx){
-                        kill(pcbs[idx].pid, SIGSTOP);
-                        running_idx = -1;
-                        fprintf(stderr,"[Kernel] SYSCALL A%d (PID %d): D%d %c -> BLOCKED\n", idx+1, pid, dev, op);
-                        schedule_next();
-                    }
+                fprintf(stderr, "[Kernel] SYSCALL A%d (PID %d): D%d %c -> BLOCKED\n",
+                        idx+1, pid, dev, op);
+                fflush(stderr); // optional, but avoids buffering surprises
+
+                // 3) Only stop and reschedule if THIS was the runner
+                if (idx == running_idx) {
+                    kill(pcbs[idx].pid, SIGSTOP);
+                    running_idx = -1;
+                    schedule_next();
+                } else if (running_idx == -1) {
+                    // If nobody is running for some reason, pick one
+                    schedule_next();
                 }
-            }
-        } else if (strncmp(line,"DONE",4)==0){
-            // Processo finalizou execução
-            int aid, pid, pc;
-            if (sscanf(line,"DONE A%d %d %d",&aid,&pid,&pc)==3){
-                int idx = pid_to_index((pid_t)pid);
-                if (idx>=0){
-                    pcbs[idx].pc = pc; pcbs[idx].state = TERMINATED;
-                    fprintf(stderr,"[Kernel] A%d (PID %d) TERMINATED (PC=%d)\n", idx+1, pid, pc);
-                    if (idx == running_idx){
-                        running_idx = -1;
-                        schedule_next();
-                    }
                 }
             }
         }
