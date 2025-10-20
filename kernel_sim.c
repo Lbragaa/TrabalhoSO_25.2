@@ -11,7 +11,7 @@
 #define MAX_BLOCKED  N_APPS
 #define MAX_READY    N_APPS
 #define QUANTUM_US   500000   // 0.5s de quantum
-
+#define MAX_PC       5
 // Estados possíveis de um processo
 enum ProcState { READY = 0, RUNNING = 1, BLOCKED = 2, TERMINATED = 3 };
 
@@ -219,7 +219,7 @@ static void run_app(int id){
     signal(SIGINT, SIG_IGN);  // ignora Ctrl-C
     raise(SIGSTOP);           // começa parado até ser escalonado
     srand((unsigned)(time(NULL) ^ getpid()));
-    int pc = 0, MAX_PC = 20;
+    int pc = 0;
 
     while (pc < MAX_PC){
         sleep(1);
