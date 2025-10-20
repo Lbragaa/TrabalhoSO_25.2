@@ -12,6 +12,10 @@
 #define MAX_READY    N_APPS
 #define QUANTUM_US   500000   // 0.5s de quantum
 #define MAX_PC       5
+#define SYSCALL_PROB 10       // 10% de chance de syscall a cada tick
+#define IRQ1_PROB          10   // 1 in 10 chance
+#define IRQ2_PROB          20   // 1 in 20 chance
+
 // Estados possíveis de um processo
 enum ProcState { READY = 0, RUNNING = 1, BLOCKED = 2, TERMINATED = 3 };
 
@@ -232,7 +236,7 @@ static void run_app(int id){
         kill(getppid(), SIGUSR2);
 
         // 10% de chance de syscall (bloqueio)
-        if (rand()%10 == 0){
+        if (rand() % SYSCALL_PROB == 0){
             int dev = (rand()%2) + 1;
             char ops[3] = {'R','W','X'};
             char op = ops[rand()%3];
@@ -261,8 +265,8 @@ static void run_interrupt_controller(void){
         if (ic_paused){ usleep(100000); continue; }
         usleep(QUANTUM_US);
         writeln(STDOUT_FILENO, "IRQ0\n"); kill(getppid(), SIGUSR1);
-        if (rand()%10 == 0){ writeln(STDOUT_FILENO,"IRQ1\n"); kill(getppid(), SIGUSR1); }
-        if (rand()%20 == 0){ writeln(STDOUT_FILENO,"IRQ2\n"); kill(getppid(), SIGUSR1); }
+        if (rand()% IRQ1_PROB == 0){ writeln(STDOUT_FILENO,"IRQ1\n"); kill(getppid(), SIGUSR1); }
+        if (rand()% IRQ2_PROB == 0){ writeln(STDOUT_FILENO,"IRQ2\n"); kill(getppid(), SIGUSR1); }
     }
 }
 
