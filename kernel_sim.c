@@ -11,10 +11,10 @@
 #define MAX_BLOCKED  N_APPS
 #define MAX_READY    N_APPS
 #define QUANTUM_US   500000   // 0.5s de quantum
-#define MAX_PC       5
+#define MAX_PC       20       // Colocamos 20 instruções por app
 #define SYSCALL_PROB 10       // 10% de chance de syscall a cada tick
-#define IRQ1_PROB          5   // 1 in 5 chance
-#define IRQ2_PROB          100   // 1 in 100 chance. Ta 20x maior.
+#define IRQ1_PROB     5   // 1 in 5 chance
+#define IRQ2_PROB     100 // 1 in 100 chance. Chance 20x menor que a do IRQ1.
 
 // Estados possíveis de um processo
 enum ProcState { READY = 0, RUNNING = 1, BLOCKED = 2, TERMINATED = 3 };
@@ -245,7 +245,6 @@ static void run_app(int id){
             int n = snprintf(msg,sizeof(msg),"SYSCALL A%d %d D%d %c\n", id, getpid(), dev, op);
             write(STDOUT_FILENO, msg, n);
             kill(getppid(), SIGUSR2);
-            raise(SIGSTOP); // pausa até ser desbloqueado
         }
         usleep(QUANTUM_US);
     }
