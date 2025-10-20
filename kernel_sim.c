@@ -1,15 +1,3 @@
-// kernel_sim.c — signals = wake-ups, pipes = data; no mem*; one read per wake; TICK + snapshot.
-// RR with explicit ready FIFO:
-// - IRQ0: running -> tail, head -> running (single-line log)
-// - IRQ1/2: unblock -> tail (always log unblocked/enqueued; if IDLE, dispatch next)
-// - SYSCALL by runner: runner -> BLOCKED (not enqueued), schedule next
-//
-// Other fixes preserved:
-// - IC signal handlers at file scope
-// - Apps ignore SIGINT so Ctrl-C only pauses kernel/IC
-// - Kernel reaps IC, closes FDs on exit
-// - Device queues reset indices when empty
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -22,52 +10,57 @@
 #define N_APPS       5
 #define MAX_BLOCKED  N_APPS
 #define MAX_READY    N_APPS
-#define QUANTUM_US   500000   // 0.5s
+#define QUANTUM_US   500000   // 0.5s de quantum
 
+// Estados possíveis de um processo
 enum ProcState { READY = 0, RUNNING = 1, BLOCKED = 2, TERMINATED = 3 };
 
+// Estrutura que representa um PCB (Process Control Block)
 struct PCB {
     pid_t pid;
-    int   id;          // 1..N_APPS
-    int   state;       // enum ProcState
-    int   pc;          // last known PC
-    int   last_dev;    // 0/1/2
-    char  last_op;     // 'R'/'W'/'X' or '\0'
-    int   cnt_d1;
-    int   cnt_d2;
+    int   id;          // ID lógico (A1..AN)
+    int   state;       // Estado atual
+    int   pc;          // Contador de programa (último PC)
+    int   last_dev;    // Último dispositivo acessado (D1/D2)
+    char  last_op;     // Última operação ('R','W','X')
+    int   cnt_d1;      // Contador de acessos ao D1
+    int   cnt_d2;      // Contador de acessos ao D2
 };
 
+// Vetor global de PCBs e índice do processo em execução
 static struct PCB pcbs[N_APPS];
 static int running_idx = -1;
 
-// ---- device wait queues (per device) ----
+// Filas de bloqueados (uma para cada dispositivo)
 static pid_t qd1[MAX_BLOCKED], qd2[MAX_BLOCKED];
 static int hd1 = 0, td1 = 0;
 static int hd2 = 0, td2 = 0;
 
-// ---- READY queue (global RR FIFO) ----
+// Fila de prontos (Round Robin)
 static int rq[MAX_READY];
 static int rq_h = 0, rq_t = 0, rq_sz = 0;
 
+// Descritores de leitura e PID do InterController
 static int inter_r = -1, app_r = -1;
 static pid_t inter_pid = -1;
 
-// ---- wake flags ----
+// Flags para sinalizar eventos pendentes
 static volatile sig_atomic_t inter_pending = 0;
 static volatile sig_atomic_t app_pending   = 0;
 
-// ---- pause/resume control (kernel) ----
+// Controle de pausa e snapshot do kernel
 static volatile sig_atomic_t want_snapshot = 0;
 static volatile sig_atomic_t want_resume   = 0;
 static int paused = 0;
 
-// ---- InterController local pause flag + handlers ----
+// Controle local de pausa do InterController
 static volatile sig_atomic_t ic_paused = 0;
 
+// Handlers locais do InterController
 static void ic_h_int(int s)  { (void)s; ic_paused = 1; }
 static void ic_h_cont(int s) { (void)s; ic_paused = 0; }
 
-// ----- small helpers (no mem*) -----
+// Funções auxiliares para manipulação de acumuladores de leitura
 static int acc_append(char acc[], int acc_cap, int *acc_len,
                       const char src[], int n)
 {
@@ -111,7 +104,7 @@ static void acc_consume_line(char acc[], int *acc_len, int linelen)
     *acc_len = new_len;
 }
 
-// ----- misc -----
+// Funções utilitárias
 static void die(const char *m) { perror(m); exit(1); }
 
 static ssize_t writeln(int fd, const char *s)
@@ -136,12 +129,10 @@ static int pid_to_index(pid_t pid)
     return -1;
 }
 
-// ----- READY queue ops -----
+// Operações da fila de prontos (Round Robin)
 static void rq_push_tail(int idx)
 {
-    if (rq_sz >= MAX_READY)
-        return;  // shouldn't happen with N_APPS cap
-
+    if (rq_sz >= MAX_READY) return;
     rq[rq_t] = idx;
     rq_t = (rq_t + 1) % MAX_READY;
     rq_sz++;
@@ -149,37 +140,35 @@ static void rq_push_tail(int idx)
 
 static int rq_pop_head(void)
 {
-    if (rq_sz == 0)
-        return -1;
-
+    if (rq_sz == 0) return -1;
     int idx = rq[rq_h];
     rq_h = (rq_h + 1) % MAX_READY;
     rq_sz--;
     return idx;
 }
 
-// Central scheduler: pick next from READY queue (if any), else idle
+// Escalonador principal (seleciona próximo processo READY)
 static void schedule_next(void){
-    // NEW: pop until we find a truly READY task; drop stale BLOCKED/TERMINATED entries.
-    int tries = rq_sz;           // upper bound: at most current size pops
+    int tries = rq_sz;
     while (tries-- > 0){
         int next = rq_pop_head();
         if (next < 0) break;
         if (pcbs[next].state == READY){
+            // Interrompe o processo anterior se estava rodando
             if (running_idx >= 0 && pcbs[running_idx].state==RUNNING){
                 kill(pcbs[running_idx].pid, SIGSTOP);
                 pcbs[running_idx].state = READY;
             }
+            // Continua o novo processo selecionado
             kill(pcbs[next].pid, SIGCONT);
             pcbs[next].state = RUNNING;
             running_idx = next;
             fprintf(stderr,"[Kernel] Now running A%d (PID %d)\n", next+1, pcbs[next].pid);
             return;
         }
-        // else: stale entry (BLOCKED/TERMINATED) — skip it and continue
     }
 
-    // none READY → idle
+    // Caso não haja processos prontos, kernel fica ocioso
     if (running_idx >= 0 && pcbs[running_idx].state==RUNNING){
         kill(pcbs[running_idx].pid, SIGSTOP);
         pcbs[running_idx].state = READY;
@@ -188,20 +177,21 @@ static void schedule_next(void){
     fprintf(stderr,"[Kernel] IDLE (no READY)\n");
 }
 
-// ----- kernel signal handlers -----
-static void h_usr1(int s){ (void)s; inter_pending = 1; }
-static void h_usr2(int s){ (void)s; app_pending   = 1; }
-static void h_int (int s){ (void)s; want_snapshot = 1; } // Ctrl-C
-static void h_cont(int s){ (void)s; want_resume   = 1; } // SIGCONT
+// Handlers de sinais principais do kernel
+static void h_usr1(int s){ (void)s; inter_pending = 1; } // IRQs do IC
+static void h_usr2(int s){ (void)s; app_pending   = 1; } // Mensagens dos apps
+static void h_int (int s){ (void)s; want_snapshot = 1; } // Ctrl-C → snapshot
+static void h_cont(int s){ (void)s; want_resume   = 1; } // SIGCONT → retomar
 
-// ----- snapshot -----
+// Impressão do snapshot do estado atual do sistema
 static void print_snapshot(void){
     fprintf(stderr, "================ SNAPSHOT (paused) PID = %d ================\n", getpid());
     for (int i=0;i<N_APPS;i++){
         struct PCB *p = &pcbs[i];
         fprintf(stderr, "A%d (PID %d): PC=%d, state=%s", p->id, (int)p->pid, p->pc, st_str(p->state));
         if (p->state == BLOCKED){
-            if (p->last_dev==1 || p->last_dev==2) fprintf(stderr, ", waiting D%d %c", p->last_dev, (p->last_op?p->last_op:'?'));
+            if (p->last_dev==1 || p->last_dev==2)
+                fprintf(stderr, ", waiting D%d %c", p->last_dev, (p->last_op?p->last_op:'?'));
             else fprintf(stderr, ", waiting D?");
         }
         fprintf(stderr, ", counts: D1=%d, D2=%d", p->cnt_d1, p->cnt_d2);
@@ -222,11 +212,12 @@ static void print_snapshot(void){
     fprintf(stderr, "===================================================\n");
 }
 
-// ------------------ Children ------------------
+// ------------------ Processos filhos ------------------
 
+// Código de um processo aplicativo (simula execução + syscalls)
 static void run_app(int id){
-    signal(SIGINT, SIG_IGN);
-    raise(SIGSTOP);
+    signal(SIGINT, SIG_IGN);  // ignora Ctrl-C
+    raise(SIGSTOP);           // começa parado até ser escalonado
     srand((unsigned)(time(NULL) ^ getpid()));
     int pc = 0, MAX_PC = 20;
 
@@ -234,12 +225,13 @@ static void run_app(int id){
         sleep(1);
         pc++;
 
-        // TICK
-        char tick[64]; int tn = snprintf(tick,sizeof(tick),"TICK A%d %d %d\n", id, getpid(), pc);
+        // Envia mensagem TICK ao kernel
+        char tick[64];
+        int tn = snprintf(tick,sizeof(tick),"TICK A%d %d %d\n", id, getpid(), pc);
         write(STDOUT_FILENO, tick, tn);
         kill(getppid(), SIGUSR2);
 
-        // ~10% chance of syscall; op ∈ {R,W,X}
+        // 10% de chance de syscall (bloqueio)
         if (rand()%10 == 0){
             int dev = (rand()%2) + 1;
             char ops[3] = {'R','W','X'};
@@ -248,15 +240,18 @@ static void run_app(int id){
             int n = snprintf(msg,sizeof(msg),"SYSCALL A%d %d D%d %c\n", id, getpid(), dev, op);
             write(STDOUT_FILENO, msg, n);
             kill(getppid(), SIGUSR2);
-
-            raise(SIGSTOP); // The process abides here until unblocked by kernel
+            raise(SIGSTOP); // pausa até ser desbloqueado
         }
     }
-    char done[64]; int dn = snprintf(done,sizeof(done),"DONE A%d %d %d\n", id, getpid(), pc);
-    write(STDOUT_FILENO, done, dn); kill(getppid(), SIGUSR2);
+    // Fim da execução
+    char done[64];
+    int dn = snprintf(done,sizeof(done),"DONE A%d %d %d\n", id, getpid(), pc);
+    write(STDOUT_FILENO, done, dn);
+    kill(getppid(), SIGUSR2);
     _exit(0);
 }
 
+// Código do InterController (gera IRQs)
 static void run_interrupt_controller(void){
     signal(SIGINT,  ic_h_int);
     signal(SIGCONT, ic_h_cont);
@@ -271,8 +266,9 @@ static void run_interrupt_controller(void){
     }
 }
 
-// ------------------ Kernel Readers ------------------
+// ------------------ Leitura dos pipes do kernel ------------------
 
+// Trata mensagens do InterController (IRQ0/1/2)
 static void drain_inter(void){
     static char acc[1024]; static int acc_len=0;
     char buf[256];
@@ -283,10 +279,12 @@ static void drain_inter(void){
 
     for(;;){
         int pos = acc_find_nl(acc, acc_len); if (pos < 0) break;
-        char line[128]; acc_copy_line(acc, pos, line, (int)sizeof(line)); acc_consume_line(acc, &acc_len, pos);
+        char line[128];
+        acc_copy_line(acc, pos, line, (int)sizeof(line));
+        acc_consume_line(acc, &acc_len, pos);
 
         if (strcmp(line,"IRQ0")==0){
-            // Timeslice: demote current to tail (if exists), pick next (single-line)
+            // Troca de processo (Round Robin)
             if (running_idx >= 0 && pcbs[running_idx].state==RUNNING){
                 int cur = running_idx;
                 pcbs[cur].state = READY;
@@ -295,49 +293,43 @@ static void drain_inter(void){
                 running_idx = -1;
             }
             int next = rq_pop_head();
-            if (next >= 0){
-                // guard: only dispatch if truly READY; else keep popping
-                if (pcbs[next].state == READY){
-                    kill(pcbs[next].pid, SIGCONT);
-                    pcbs[next].state = RUNNING;
-                    running_idx = next;
-                    fprintf(stderr,"[Kernel] IRQ0 -> Now running A%d (PID %d)\n", next+1, pcbs[next].pid);
-                } else {
-                    // stale; rely on schedule_next to complete selection
-                    rq_push_tail(next); // optional: drop instead; here we requeue then call scheduler
-                    schedule_next();
-                }
+            if (next >= 0 && pcbs[next].state == READY){
+                kill(pcbs[next].pid, SIGCONT);
+                pcbs[next].state = RUNNING;
+                running_idx = next;
+                fprintf(stderr,"[Kernel] IRQ0 -> Now running A%d (PID %d)\n", next+1, pcbs[next].pid);
             } else {
-                fprintf(stderr,"[Kernel] IRQ0 -> IDLE (no READY)\n");
+                schedule_next();
             }
         } else if (strcmp(line,"IRQ1")==0){
+            // Dispositivo D1 concluiu operação
             if (hd1 < td1){
                 pid_t pid = qd1[hd1++]; int idx = pid_to_index(pid);
-                if (hd1 == td1) { hd1 = td1 = 0; }  // reset when empty
+                if (hd1 == td1) { hd1 = td1 = 0; }
                 if (idx>=0 && pcbs[idx].state!=TERMINATED){
                     pcbs[idx].state = READY;
                     rq_push_tail(idx);
                     fprintf(stderr,"[Kernel] IRQ1 -> unblocked A%d (PID %d) enqueued\n", idx+1, pid);
-                    if (running_idx == -1) schedule_next(); // will print "Now running ..."
+                    if (running_idx == -1) schedule_next();
                 }
             }
         } else if (strcmp(line,"IRQ2")==0){
+            // Dispositivo D2 concluiu operação
             if (hd2 < td2){
                 pid_t pid = qd2[hd2++]; int idx = pid_to_index(pid);
-                if (hd2 == td2) { hd2 = td2 = 0; }  // reset when empty
+                if (hd2 == td2) { hd2 = td2 = 0; }
                 if (idx>=0 && pcbs[idx].state!=TERMINATED){
                     pcbs[idx].state = READY;
                     rq_push_tail(idx);
                     fprintf(stderr,"[Kernel] IRQ2 -> unblocked A%d (PID %d) enqueued\n", idx+1, pid);
-                    if (running_idx == -1) schedule_next(); // will print "Now running ..."
+                    if (running_idx == -1) schedule_next();
                 }
             }
-        } else {
-            fprintf(stderr,"[Kernel] Unknown IRQ: '%s'\n", line);
         }
     }
 }
 
+// Trata mensagens dos aplicativos (TICK, SYSCALL, DONE)
 static void drain_apps(void){
     static char acc[4096]; static int acc_len=0;
     char buf[512];
@@ -348,20 +340,25 @@ static void drain_apps(void){
 
     for(;;){
         int pos = acc_find_nl(acc, acc_len); if (pos < 0) break;
-        char line[512]; acc_copy_line(acc, pos, line, (int)sizeof(line)); acc_consume_line(acc, &acc_len, pos);
+        char line[512];
+        acc_copy_line(acc, pos, line, (int)sizeof(line));
+        acc_consume_line(acc, &acc_len, pos);
 
-        if (strncmp(line,"TICK", 4)==0){
+        if (strncmp(line,"TICK",4)==0){
+            // Atualiza PC do processo
             int aid, pid, pc;
-            if (sscanf(line, "TICK A%d %d %d", &aid, &pid, &pc)==3){
+            if (sscanf(line,"TICK A%d %d %d",&aid,&pid,&pc)==3){
                 int idx = pid_to_index((pid_t)pid);
-                if (idx>=0 && pcbs[idx].state != TERMINATED) pcbs[idx].pc = pc;
+                if (idx>=0 && pcbs[idx].state != TERMINATED)
+                    pcbs[idx].pc = pc;
             }
         } else if (strncmp(line,"SYSCALL",7)==0){
+            // Processo fez syscall → bloqueia
             int aid, pid, dev; char op;
-            if (sscanf(line,"SYSCALL A%d %d D%d %c", &aid, &pid, &dev, &op)==4){
+            if (sscanf(line,"SYSCALL A%d %d D%d %c",&aid,&pid,&dev,&op)==4){
                 int idx = pid_to_index((pid_t)pid);
                 if (idx>=0 && pcbs[idx].state!=TERMINATED){
-                    pcbs[idx].state = BLOCKED; pcbs[idx].last_dev = dev; pcbs[idx].last_op  = op;
+                    pcbs[idx].state = BLOCKED; pcbs[idx].last_dev = dev; pcbs[idx].last_op = op;
                     if (dev==1){ pcbs[idx].cnt_d1++; if (td1<MAX_BLOCKED) qd1[td1++] = (pid_t)pid; }
                     else if (dev==2){ pcbs[idx].cnt_d2++; if (td2<MAX_BLOCKED) qd2[td2++] = (pid_t)pid; }
 
@@ -370,12 +367,11 @@ static void drain_apps(void){
                         running_idx = -1;
                         fprintf(stderr,"[Kernel] SYSCALL A%d (PID %d): D%d %c -> BLOCKED\n", idx+1, pid, dev, op);
                         schedule_next();
-                    } else {
-                        fprintf(stderr,"[Kernel] SYSCALL A%d (PID %d): D%d %c -> BLOCKED (wasn't running)\n", idx+1, pid, dev, op);
                     }
                 }
             }
         } else if (strncmp(line,"DONE",4)==0){
+            // Processo finalizou execução
             int aid, pid, pc;
             if (sscanf(line,"DONE A%d %d %d",&aid,&pid,&pc)==3){
                 int idx = pid_to_index((pid_t)pid);
@@ -388,13 +384,11 @@ static void drain_apps(void){
                     }
                 }
             }
-        } else {
-            fprintf(stderr,"[Kernel] Unknown app msg: '%s'\n", line);
         }
     }
 }
 
-// ------------------ Kernel main ------------------
+// ------------------ Kernel principal ------------------
 
 static void run_kernel(void){
     fprintf(stderr, "[Kernel] PID=%d\n", getpid());
@@ -402,96 +396,165 @@ static void run_kernel(void){
     int inter_p[2], app_p[2];
     if (pipe(inter_p)==-1 || pipe(app_p)==-1) die("pipe");
 
-    // spawn InterController
+    // Cria o processo do InterController
     inter_pid = fork(); if (inter_pid == -1) die("fork inter");
     if (inter_pid == 0){
         close(inter_p[0]);
-        if (dup2(inter_p[1], STDOUT_FILENO)==-1) die("dup2 inter");
+        dup2(inter_p[1], STDOUT_FILENO);
         close(inter_p[1]); close(app_p[0]); close(app_p[1]);
         execlp("./kernel_sim","kernel_sim","inter",NULL); die("exec inter");
     }
 
-    // spawn apps
+    // Cria os aplicativos
     for (int i=0;i<N_APPS;i++){
         pid_t p = fork(); if (p == -1) die("fork app");
         if (p == 0){
             close(app_p[0]);
-            if (dup2(app_p[1], STDOUT_FILENO)==-1) die("dup2 app");
+            dup2(app_p[1], STDOUT_FILENO);
             close(app_p[1]); close(inter_p[0]); close(inter_p[1]);
-            char idstr[8]; int m = snprintf(idstr,sizeof(idstr), "%d", i+1); (void)m;
-            execlp("./kernel_sim","kernel_sim","app", idstr, NULL); die("exec app");
+            char idstr[8];
+            snprintf(idstr, sizeof(idstr), "%d", i + 1);
+            execlp("./kernel_sim", "kernel_sim", "app", idstr, NULL);
+            die("exec app");
         }
-        pcbs[i].pid=p; pcbs[i].id=i+1; pcbs[i].state=READY; pcbs[i].pc=0;
-        pcbs[i].last_dev=0; pcbs[i].last_op='\0'; pcbs[i].cnt_d1=pcbs[i].cnt_d2=0;
+
+        // Inicializa PCB do novo processo
+        pcbs[i].pid = p;
+        pcbs[i].id = i + 1;
+        pcbs[i].state = READY;
+        pcbs[i].pc = 0;
+        pcbs[i].last_dev = 0;
+        pcbs[i].last_op = '\0';
+        pcbs[i].cnt_d1 = pcbs[i].cnt_d2 = 0;
     }
 
-    close(inter_p[1]); close(app_p[1]); inter_r = inter_p[0]; app_r = app_p[0];
+    // Fecha descritores desnecessários no kernel
+    close(inter_p[1]);
+    close(app_p[1]);
+    inter_r = inter_p[0];
+    app_r = app_p[0];
 
-    signal(SIGUSR1, h_usr1); signal(SIGUSR2, h_usr2);
-    signal(SIGINT,  h_int ); signal(SIGCONT, h_cont);
+    // Instala handlers de sinais do kernel
+    signal(SIGUSR1, h_usr1);
+    signal(SIGUSR2, h_usr2);
+    signal(SIGINT,  h_int);
+    signal(SIGCONT, h_cont);
 
-    // Build initial READY queue: all apps; start A1
-    rq_h=rq_t=rq_sz=0;
-    for (int i=0;i<N_APPS;i++) rq_push_tail(i);
+    // Inicializa a fila de prontos com todos os processos
+    rq_h = rq_t = rq_sz = 0;
+    for (int i = 0; i < N_APPS; i++)
+        rq_push_tail(i);
+
     running_idx = -1;
-    schedule_next(); // starts A1
+    schedule_next(); // inicia execução de A1
 
-    fprintf(stderr,"[Kernel] Started. Running A1 (PID %d)\n", pcbs[0].pid);
+    fprintf(stderr, "[Kernel] Started. Running A1 (PID %d)\n", pcbs[0].pid);
 
-    for(;;){
-        pause();
+    // Loop principal do kernel
+    for (;;) {
+        pause(); // espera sinal
 
-        if (want_snapshot){
-            want_snapshot = 0; paused = 1;
-            if (inter_pid > 0) kill(inter_pid, SIGINT);
-            if (running_idx >= 0 && pcbs[running_idx].state==RUNNING)
+        // Gera snapshot (Ctrl+C)
+        if (want_snapshot) {
+            want_snapshot = 0;
+            paused = 1;
+            if (inter_pid > 0)
+                kill(inter_pid, SIGINT);
+            if (running_idx >= 0 && pcbs[running_idx].state == RUNNING)
                 kill(pcbs[running_idx].pid, SIGSTOP);
             print_snapshot();
         }
-        if (want_resume){
-            want_resume = 0; paused = 0;
-            if (inter_pid > 0) kill(inter_pid, SIGCONT);
-            if (running_idx >= 0 && pcbs[running_idx].state==RUNNING)
+
+        // Retoma execução após snapshot (SIGCONT)
+        if (want_resume) {
+            want_resume = 0;
+            paused = 0;
+            if (inter_pid > 0)
+                kill(inter_pid, SIGCONT);
+            if (running_idx >= 0 && pcbs[running_idx].state == RUNNING)
                 kill(pcbs[running_idx].pid, SIGCONT);
-            fprintf(stderr,"[Kernel] Resumed.\n");
+            fprintf(stderr, "[Kernel] Resumed.\n");
         }
 
-        if (!paused){
-            if (inter_pending){ inter_pending = 0; drain_inter(); }
-            if (app_pending)  { app_pending   = 0; drain_apps();  }
+        // Processa sinais pendentes (se não estiver pausado)
+        if (!paused) {
+            if (inter_pending) {
+                inter_pending = 0;
+                drain_inter();
+            }
+            if (app_pending) {
+                app_pending = 0;
+                drain_apps();
+            }
         }
 
-        // reap children
-        int status; pid_t r;
-        while ((r = waitpid(-1, &status, WNOHANG)) > 0){
+        // Recolhe (reap) processos filhos finalizados sem bloquear
+        int status;
+        pid_t r;
+        while ((r = waitpid(-1, &status, WNOHANG)) > 0) {
             int idx = pid_to_index(r);
-            if (idx >= 0 && pcbs[idx].state != TERMINATED){
+            if (idx >= 0 && pcbs[idx].state != TERMINATED) {
                 pcbs[idx].state = TERMINATED;
-                fprintf(stderr,"[Kernel] (reap) A%d (PID %d) TERMINATED\n", idx+1, (int)r);
-                if (idx == running_idx){
+                fprintf(stderr, "[Kernel] (reap) A%d (PID %d) TERMINATED\n", idx + 1, (int)r);
+                if (idx == running_idx) {
                     running_idx = -1;
                     schedule_next();
                 }
             }
         }
 
-        int alive = 0; for (int i=0;i<N_APPS;i++) if (pcbs[i].state != TERMINATED){ alive=1; break; }
-        if (!alive){
-            if (inter_pid > 0){ kill(inter_pid, SIGTERM); waitpid(inter_pid, NULL, 0); }
+        // Verifica se ainda há processos vivos
+        int alive = 0;
+        for (int i = 0; i < N_APPS; i++)
+            if (pcbs[i].state != TERMINATED) {
+                alive = 1;
+                break;
+            }
+
+        // Se todos terminaram, encerra o kernel e limpa recursos
+        if (!alive) {
+            if (inter_pid > 0) {
+                kill(inter_pid, SIGTERM);
+                waitpid(inter_pid, NULL, 0);
+            }
             if (inter_r >= 0) close(inter_r);
-            if (app_r   >= 0) close(app_r);
-            fprintf(stderr,"[Kernel] All apps terminated. Exiting.\n");
+            if (app_r >= 0) close(app_r);
+            fprintf(stderr, "[Kernel] All apps terminated. Exiting.\n");
             break;
         }
     }
 }
 
-int main(int argc, char *argv[]){
-    if (argc == 1){ run_kernel(); return 0; }
-    if (argc >= 2 && strcmp(argv[1],"inter")==0){ run_interrupt_controller(); return 0; }
-    if (argc >= 3 && strcmp(argv[1],"app")==0){
-        int id = atoi(argv[2]); if (id<1 || id>N_APPS) id=1; run_app(id); return 0;
+// ------------------ Função principal ------------------
+
+int main(int argc, char *argv[]) {
+    // Executa o kernel principal
+    if (argc == 1) {
+        run_kernel();
+        return 0;
     }
-    fprintf(stderr,"Usage:\n  ./kernel_sim               (kernel)\n  ./kernel_sim inter         (interrupt controller)\n  ./kernel_sim app <id>      (app)\n");
+
+    // Executa o modo "inter" (InterController)
+    if (argc >= 2 && strcmp(argv[1], "inter") == 0) {
+        run_interrupt_controller();
+        return 0;
+    }
+
+    // Executa o modo "app <id>" (processo aplicativo)
+    if (argc >= 3 && strcmp(argv[1], "app") == 0) {
+        int id = atoi(argv[2]);
+        if (id < 1 || id > N_APPS)
+            id = 1;
+        run_app(id);
+        return 0;
+    }
+
+    // Caso o uso esteja incorreto
+    fprintf(stderr,
+        "Uso:\n"
+        "  ./kernel_sim               (kernel)\n"
+        "  ./kernel_sim inter         (interrupt controller)\n"
+        "  ./kernel_sim app <id>      (app)\n");
     return 1;
 }
+
